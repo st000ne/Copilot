@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -41,7 +41,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/session/new")
+@app.post("/session")
 def new_session():
     with get_session() as db:
         s = ChatSession()
@@ -49,6 +49,44 @@ def new_session():
         db.commit()
         db.refresh(s)
         return {"session_id": s.id, "created_at": s.created_at}
+
+
+@app.get("/sessions")
+def list_sessions():
+    """List all chat sessions (id, title, created_at, updated_at, request_count)."""
+    with get_session() as db:
+        sessions = db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
+        return sessions
+
+
+@app.patch("/session/{session_id}")
+def rename_session(session_id: int, data: dict = Body(...)):
+    """Rename a chat session."""
+    new_name = data.get("name")
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Missing 'title'")
+    with get_session() as db:
+        session = db.get(ChatSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session.name = new_name
+        db.commit()
+        db.refresh(session)
+        return session
+
+
+@app.delete("/session/{session_id}")
+def delete_session(session_id: int):
+    """Delete a session and its messages."""
+    with get_session() as db:
+        session = db.get(ChatSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        # Delete all messages first
+        db.query(ChatMessage).filter(ChatMessage.session_id == session_id).delete()
+        db.delete(session)
+        db.commit()
+        return {"ok": True, "deleted_session_id": session_id}
 
 
 @app.get("/session/{session_id}/history")

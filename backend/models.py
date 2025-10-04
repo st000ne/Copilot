@@ -8,7 +8,9 @@ def utcnow():
 
 class ChatSession(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(default="New Chat")
     created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
     request_count: int = Field(default=0)
     messages: list["ChatMessage"] = Relationship(back_populates="session")
 
@@ -18,4 +20,5 @@ class ChatMessage(SQLModel, table=True):
     role: str
     content: str
     created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
     session: Optional[ChatSession] = Relationship(back_populates="messages")
