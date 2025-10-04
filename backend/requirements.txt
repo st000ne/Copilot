@@ -7,3 +7,4 @@ pytest-asyncio
 httpx
 langchain
 langchain-openai
+sqlmodel
