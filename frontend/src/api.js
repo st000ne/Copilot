@@ -47,3 +47,19 @@ export async function deleteSession(sessionId) {
   if (!res.ok) throw new Error("Failed to delete session");
   return res.json();
 }
+
+export async function editAndRegenerateMessage(id, newText) {
+  const res = await fetch(`${API_URL}/message/${id}/edit?content=${encodeURIComponent(newText)}`, {
+    method: "PATCH",
+  });
+  if (!res.ok) throw new Error("Failed to edit & regenerate");
+  return res.json();
+}
+
+export async function continueChat(sessionId) {
+  const res = await fetch(`${API_URL}/session/${sessionId}/continue`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Failed to continue chat");
+  return res.json();
+}

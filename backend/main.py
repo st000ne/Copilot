@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import func
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
@@ -95,13 +96,102 @@ def get_history(session_id: int):
         session = db.get(ChatSession, session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+
         messages = (
             db.query(ChatMessage)
             .filter(ChatMessage.session_id == session_id)
             .order_by(ChatMessage.created_at)
             .all()
         )
-        return {"session_id": session_id, "messages": messages}
+
+        return {
+            "session_id": session_id,
+            "messages": [
+                {
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "created_at": m.created_at.isoformat(),
+                    "updated_at": m.updated_at.isoformat(),
+                }
+                for m in messages
+            ],
+        }
+
+
+@app.patch("/message/{message_id}/edit")
+async def edit_and_regenerate(message_id: int, content: str):
+    with get_session() as db:
+        msg = db.get(ChatMessage, message_id)
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        session = db.get(ChatSession, msg.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        msg.content = content
+        msg.updated_at = datetime.now(timezone.utc)
+
+        # Remove later assistant messages (after this user message)
+        later_msgs = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == msg.session_id)
+            .filter(ChatMessage.id > message_id)
+            .filter(ChatMessage.role == "assistant")
+            .all()
+        )
+        for lm in later_msgs:
+            db.delete(lm)
+        db.commit()
+
+        # Re-run the chat pipeline
+        all_msgs = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == msg.session_id)
+            .order_by(ChatMessage.id)
+            .all()
+        )
+
+        loop = asyncio.get_running_loop()
+        reply = await loop.run_in_executor(None, lambda: run_chat([m.model_dump() for m in all_msgs]))
+
+        # Save the new assistant reply
+        new_msg = ChatMessage(
+            session_id=msg.session_id, role=reply["role"], content=reply["content"]
+        )
+        db.add(new_msg)
+        session.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+        return {
+            "reply": {"id": new_msg.id, "content": new_msg.content, "role": new_msg.role},
+            "edited_message_id": message_id,
+        }
+
+
+@app.post("/session/{session_id}/continue")
+async def continue_chat(session_id: int):
+    with get_session() as db:
+        session = db.get(ChatSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        messages = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.id)
+            .all()
+        )
+
+        loop = asyncio.get_running_loop()
+        reply = await loop.run_in_executor(None, lambda: run_chat([m.model_dump() for m in messages]))
+
+        new_msg = ChatMessage(session_id=session_id, role="assistant", content=reply["content"])
+        db.add(new_msg)
+        db.commit()
+
+        return {"id": new_msg.id, "content": new_msg.content, "role": "assistant"}
 
 
 @app.post("/chat")
@@ -114,7 +204,7 @@ async def chat(req: ChatRequest):
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Simple rate limit
+        # 🔹 Rate limiting
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)
         recent_msgs = (
             db.query(ChatMessage)
@@ -125,26 +215,67 @@ async def chat(req: ChatRequest):
         if recent_msgs >= RATE_LIMIT:
             raise HTTPException(status_code=429, detail="Rate limit exceeded (20 requests/minute).")
 
+        # 🔹 Validate input length
         total_chars = sum(len(m.content) for m in req.messages)
         if total_chars > 20000:
             raise HTTPException(status_code=400, detail="Input too long (20k char limit).")
 
-        # Save user messages
+        # 🔹 Save user messages and collect them for response
+        user_messages = []
         for m in req.messages:
-            db.add(ChatMessage(session_id=req.session_id, role=m.role, content=m.content))
+            msg = ChatMessage(session_id=req.session_id, role=m.role, content=m.content)
+            db.add(msg)
+            db.flush()  # ensures ID is generated before commit
+            user_messages.append(msg)
+        db.commit()
+
+        # 🔹 Update session activity timestamp
+        session.updated_at = datetime.now(timezone.utc)
+        db.add(session)
         db.commit()
 
         try:
-            # Run synchronous pipeline safely in background thread
+            # 🔹 Run synchronous pipeline safely in background thread
             loop = asyncio.get_running_loop()
-            reply = await loop.run_in_executor(None, lambda: run_chat([m.model_dump() for m in req.messages]))
+            reply = await loop.run_in_executor(
+                None, lambda: run_chat([m.model_dump() for m in req.messages])
+            )
 
-            # Save assistant message
-            db.add(ChatMessage(session_id=req.session_id, role=reply["role"], content=reply["content"]))
+            # 🔹 Save assistant reply
+            assistant_msg = ChatMessage(
+                session_id=req.session_id, role=reply["role"], content=reply["content"]
+            )
+            db.add(assistant_msg)
+            db.flush()
             session.request_count += 1
             db.commit()
 
-            return {"reply": reply, "session_id": req.session_id}
+            # 🔹 Return all messages (user + assistant) with IDs
+            return {
+                "session_id": req.session_id,
+                "messages": [
+                    {
+                        "id": m.id,
+                        "role": m.role,
+                        "content": m.content,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in user_messages + [assistant_msg]
+                ],
+            }
 
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Pipeline error: {str(e)}")
+
+
+@app.get("/stats")
+def get_stats():
+    with get_session() as db:
+        total_sessions = db.query(func.count(ChatSession.id)).scalar()
+        total_messages = db.query(func.count(ChatMessage.id)).scalar()
+        last_message_time = db.query(func.max(ChatMessage.created_at)).scalar()
+        return {
+            "sessions": total_sessions,
+            "messages": total_messages,
+            "last_message_time": last_message_time,
+        }
