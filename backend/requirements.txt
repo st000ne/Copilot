@@ -7,4 +7,6 @@ pytest-asyncio
 httpx
 langchain
 langchain-openai
+langchain-community
 sqlmodel
+faiss-cpu

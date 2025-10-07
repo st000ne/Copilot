@@ -2,9 +2,11 @@ import os
 from dotenv import load_dotenv
 from pydantic import SecretStr
 
-# ⚠️ Verify imports: in newer versions, ChatOpenAI comes from langchain_openai
-from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain_openai import ChatOpenAI   # ✅ verify import name in your installed LangChain version
+import tiktoken
+
+from backend.memory import query_memory, add_memory
 
 from pathlib import Path
 
@@ -15,19 +17,80 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY environment variable. See .env.example")
 
-# Initialize the LangChain model
-llm = ChatOpenAI(
-    model_name="gpt-3.5-turbo",
-    temperature=0.2,
-    max_tokens=500,
-    openai_api_key=SecretStr(OPENAI_API_KEY),
+
+# --- Config ---
+MODEL_NAME = "gpt-4o-mini"          # or "gpt-3.5-turbo"
+MAX_CONTEXT_TOKENS = 3000           # ~half the context window for safety
+SUMMARIZE_AFTER_MESSAGES = 20       # when to start summarizing
+SYSTEM_PROMPT = (
+    "You are Copilot, a helpful, intelligent assistant that remembers context "
+    "and answers clearly, concisely, and helpfully."
 )
 
-def run_chat(messages):
+# Initialize the main chat model
+llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0.7, openai_api_key=SecretStr(OPENAI_API_KEY))
+
+# Optional summarizer model (cheaper/faster)
+summarizer = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3, openai_api_key=SecretStr(OPENAI_API_KEY))
+
+# --- Helpers ---
+def num_tokens_from_messages(messages, model_name=MODEL_NAME):
+    """Rough token count using tiktoken for safe trimming."""
+    enc = tiktoken.encoding_for_model(model_name)
+    text = "".join(m["content"] for m in messages)
+    return len(enc.encode(text))
+
+def summarize_messages(messages):
+    """Summarize older messages when conversation grows too long."""
+    summary_prompt = (
+        "Summarize the following conversation briefly so it can be used as context:\n\n"
+        + "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+    )
+    resp = summarizer.invoke([HumanMessage(content=summary_prompt)])
+    return resp.content.strip()
+
+# --- Main Chat Function ---
+def run_chat(messages: list[dict]):
     """
-    messages: list of dicts with role/content (user/assistant/system)
+    messages: list of dicts with role/content ('user'|'assistant'|'system')
     returns: dict with role/content for the assistant reply
     """
+
+    # Ensure we always start with a system prompt
+    if not any(m["role"] == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+    # Summarize if conversation is getting long
+    if len(messages) > SUMMARIZE_AFTER_MESSAGES:
+        summary_text = summarize_messages(messages[:-10])  # summarize older part
+        messages = (
+            [messages[0],  # keep system
+             {"role": "system", "content": f"Conversation summary: {summary_text}"}]
+            + messages[-10:]  # keep last few turns
+        )
+
+    # Trim if token usage exceeds limit
+    while num_tokens_from_messages(messages) > MAX_CONTEXT_TOKENS and len(messages) > 5:
+        messages.pop(1)  # remove oldest non-system message
+
+    user_last = next((m for m in reversed(messages) if m["role"] == "user"), None)
+    retrieved_memories = query_memory(user_last["content"]) if user_last else []
+
+    if retrieved_memories:
+        facts = "\n".join(f"- {m}" for m in retrieved_memories)
+        messages.insert(
+            1,
+            {
+                "role": "system",
+                "content": (
+                    "You have access to the following remembered facts from past interactions. "
+                    "Use them naturally in your responses, as if you recall them from memory:\n"
+                    f"{facts}"
+                ),
+            },
+        )
+
+    # Convert to LangChain message objects
     lc_messages = []
     for m in messages:
         if m["role"] == "user":
@@ -37,5 +100,7 @@ def run_chat(messages):
         elif m["role"] == "system":
             lc_messages.append(SystemMessage(content=m["content"]))
 
-    response = llm.invoke(lc_messages)  # synchronous for now
+    # --- Invoke the model ---
+    response = llm.invoke(lc_messages)  # synchronous call
+
     return {"role": "assistant", "content": response.content}

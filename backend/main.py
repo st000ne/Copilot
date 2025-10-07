@@ -9,6 +9,7 @@ from backend.db import init_db, get_session
 from backend.models import ChatSession, ChatMessage
 import asyncio
 from backend.pipeline import run_chat
+from backend.memory import add_memory
 
 load_dotenv()
 
@@ -266,6 +267,12 @@ async def chat(req: ChatRequest):
 
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Pipeline error: {str(e)}")
+
+
+@app.post("/memory/add")
+def add_mem(text: str = Body(...)):
+    add_memory(text)
+    return {"status": "ok"}
 
 
 @app.get("/stats")
