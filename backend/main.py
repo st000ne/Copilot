@@ -270,9 +270,12 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/memory/add")
-def add_mem(text: str = Body(...)):
-    add_memory(text)
-    return {"status": "ok"}
+def add_mem(
+    text: str = Body(...),
+    memory_type: str = Body("fact"),
+):
+    add_memory(text, memory_type)
+    return {"status": "ok", "type": memory_type}
 
 
 @app.get("/stats")

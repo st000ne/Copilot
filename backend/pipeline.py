@@ -74,23 +74,28 @@ def run_chat(messages: list[dict]):
         messages.pop(1)  # remove oldest non-system message
 
     user_last = next((m for m in reversed(messages) if m["role"] == "user"), None)
-    retrieved_memories = query_memory(user_last["content"]) if user_last else []
+    retrieved = query_memory(user_last["content"]) if user_last else []
 
-    if retrieved_memories:
-        facts = "\n".join(f"- {m}" for m in retrieved_memories)
+    if retrieved:
+        # Build structured system message
+        mem_context = "\n".join(
+            f"- ({r['source']}, score={r['score']:.2f}): {r['content']}"
+            for r in retrieved
+        )
+
         messages.insert(
             1,
             {
                 "role": "system",
                 "content": (
-                    "You have access to the following remembered facts from past interactions. "
-                    "Use them naturally in your responses, as if you recall them from memory:\n"
-                    f"{facts}"
+                    "You have access to relevant contextual knowledge retrieved "
+                    "from your memory stores. Use this information naturally:\n"
+                    f"{mem_context}"
                 ),
             },
         )
 
-    # Convert to LangChain message objects
+    # Now rebuild lc_messages AFTER injection
     lc_messages = []
     for m in messages:
         if m["role"] == "user":
@@ -100,7 +105,5 @@ def run_chat(messages: list[dict]):
         elif m["role"] == "system":
             lc_messages.append(SystemMessage(content=m["content"]))
 
-    # --- Invoke the model ---
-    response = llm.invoke(lc_messages)  # synchronous call
-
+    response = llm.invoke(lc_messages)
     return {"role": "assistant", "content": response.content}
