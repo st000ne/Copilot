@@ -1,5 +1,7 @@
+// src/App.jsx
 import React, { useState, useEffect } from "react";
 import Sidebar from "./Sidebar";
+import MemoryPanel from "./MemoryPanel";
 import {
   createSession,
   sendChat,
@@ -7,6 +9,8 @@ import {
   editAndRegenerateMessage,
   continueChat,
 } from "./api";
+
+// ... keep Message component unchanged (copy from your original) ...
 
 function Message({ msg, onEdit, onContinue }) {
   const [editing, setEditing] = React.useState(false);
@@ -220,10 +224,7 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "sans-serif" }}>
-      <Sidebar
-        currentSessionId={sessionId}
-        onSelectSession={(id) => setSessionId(id)}
-      />
+      <Sidebar currentSessionId={sessionId} onSelectSession={(id) => setSessionId(id)} />
 
       {/* Chat Area */}
       <div
@@ -256,12 +257,7 @@ export default function App() {
             <p style={{ color: "#999" }}>No messages yet.</p>
           ) : (
             messages.map((m, i) => (
-              <Message
-                key={i}
-                msg={m}
-                onEdit={handleEditMessage}
-                onContinue={handleContinue}
-              />
+              <Message key={i} msg={m} onEdit={handleEditMessage} onContinue={handleContinue} />
             ))
           )}
         </div>
@@ -299,6 +295,9 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {/* Memory / Docs Panel */}
+      <MemoryPanel />
     </div>
   );
 }

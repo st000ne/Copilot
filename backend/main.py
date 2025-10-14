@@ -8,8 +8,19 @@ from datetime import datetime, timedelta, timezone
 from backend.db import init_db, get_session
 from backend.models import ChatSession, ChatMessage
 import asyncio
-from backend.pipeline import run_chat
-from backend.memory import add_memory
+from backend.pipeline import run_chat, _extract_texts_from_faiss_index
+from backend.memory import (
+    add_memory,
+    get_or_create_faiss_index,
+    delete_memory,
+    edit_memory
+)
+from backend.docs import (
+    list_documents,
+    add_document,
+    delete_document,
+    edit_document
+)
 
 load_dotenv()
 
@@ -37,6 +48,13 @@ class ChatRequest(BaseModel):
     model: str = "gpt-3.5-turbo"
     max_tokens: int = 500
     session_id: Optional[int] = None
+
+class TextPayload(BaseModel):
+    text: str
+
+class EditPayload(BaseModel):
+    old_text: str
+    new_text: str
 
 @app.get("/health")
 async def health():
@@ -269,23 +287,90 @@ async def chat(req: ChatRequest):
             raise HTTPException(status_code=502, detail=f"Pipeline error: {str(e)}")
 
 
+# ===== MEMORY MANAGEMENT =====
+@app.get("/memory/list")
+def list_memories():
+    """List all memory items stored in FAISS."""
+    try:
+        index = get_or_create_faiss_index()
+        texts = _extract_texts_from_faiss_index(index)
+        return {"facts": texts}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing memories: {e}")
+
+
+@app.get("/memory/list")
+def list_memories():
+    """List all memory items stored in FAISS."""
+    try:
+        index = get_or_create_faiss_index()
+        texts = _extract_texts_from_faiss_index(index)
+        return texts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing memories: {e}")
+
+
 @app.post("/memory/add")
-def add_mem(
-    text: str = Body(...),
-    memory_type: str = Body("fact"),
-):
-    add_memory(text, memory_type)
-    return {"status": "ok", "type": memory_type}
+def add_memory_endpoint(payload: TextPayload):
+    """Add a memory (fact) to FAISS index."""
+    try:
+        add_memory(payload.text)
+        return {"ok": True, "text": payload.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add memory: {e}")
 
 
-@app.get("/stats")
-def get_stats():
-    with get_session() as db:
-        total_sessions = db.query(func.count(ChatSession.id)).scalar()
-        total_messages = db.query(func.count(ChatMessage.id)).scalar()
-        last_message_time = db.query(func.max(ChatMessage.created_at)).scalar()
-        return {
-            "sessions": total_sessions,
-            "messages": total_messages,
-            "last_message_time": last_message_time,
-        }
+@app.patch("/memory/edit")
+def edit_memory_endpoint(payload: EditPayload):
+    """Edit an existing memory item using its old text."""
+    try:
+        edit_memory(payload.old_text, payload.new_text)
+        return {"ok": True, "old_text": payload.old_text, "new_text": payload.new_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to edit memory: {e}")
+
+
+@app.delete("/memory/delete")
+def delete_doc_endpoint(payload: TextPayload):
+    try:
+        result = delete_memory(payload.text)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {e}")
+
+
+# ===== DOCS MANAGEMENT =====
+@app.get("/docs/list")
+def list_docs():
+    """List all document chunks from FAISS."""
+    try:
+        return {"docs": list_documents() or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing docs: {e}")
+
+
+@app.post("/docs/add")
+def add_docs_endpoint(payload: TextPayload):
+    try:
+        n_chunks = add_document(payload.text)
+        return {"ok": True, "chunks_added": n_chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add doc: {e}")
+
+
+@app.patch("/docs/edit")
+def edit_doc_endpoint(payload: EditPayload):
+    try:
+        result = edit_document(payload.old_text, payload.new_text)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to edit doc: {e}")
+
+
+@app.delete("/docs/delete")
+def delete_doc_endpoint(payload: TextPayload):
+    try:
+        result = delete_document(payload.text)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete doc: {e}")
