@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import func
+import os
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
@@ -18,9 +20,13 @@ from backend.memory import (
 from backend.docs import (
     list_documents,
     add_document,
-    delete_document,
+    delete_document_by_filename,
     edit_document
 )
+from backend.file_utils import extract_text_from_file
+from backend.docs import reindex_docs
+from backend.memory import reindex_memories
+
 
 load_dotenv()
 
@@ -38,6 +44,7 @@ init_db()
 
 RATE_LIMIT = 20
 WINDOW_MINUTES = 1
+UPLOADS_DIR = "backend/data/docs"
 
 class Message(BaseModel):
     role: str
@@ -55,6 +62,9 @@ class TextPayload(BaseModel):
 class EditPayload(BaseModel):
     old_text: str
     new_text: str
+
+class DeleteDocPayload(BaseModel):
+    filename: str
 
 @app.get("/health")
 async def health():
@@ -299,17 +309,6 @@ def list_memories():
         raise HTTPException(status_code=500, detail=f"Error listing memories: {e}")
 
 
-@app.get("/memory/list")
-def list_memories():
-    """List all memory items stored in FAISS."""
-    try:
-        index = get_or_create_faiss_index()
-        texts = _extract_texts_from_faiss_index(index)
-        return texts
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing memories: {e}")
-
-
 @app.post("/memory/add")
 def add_memory_endpoint(payload: TextPayload):
     """Add a memory (fact) to FAISS index."""
@@ -322,21 +321,18 @@ def add_memory_endpoint(payload: TextPayload):
 
 @app.patch("/memory/edit")
 def edit_memory_endpoint(payload: EditPayload):
-    """Edit an existing memory item using its old text."""
     try:
-        edit_memory(payload.old_text, payload.new_text)
-        return {"ok": True, "old_text": payload.old_text, "new_text": payload.new_text}
+        return edit_memory(payload.old_text, payload.new_text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to edit memory: {e}")
+        return JSONResponse(status_code=500, content={"edited": False, "reason": str(e)})
 
 
 @app.delete("/memory/delete")
-def delete_doc_endpoint(payload: TextPayload):
+def delete_memory_endpoint(payload: TextPayload):
     try:
-        result = delete_memory(payload.text)
-        return {"ok": True, "result": result}
+        return delete_memory(payload.text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {e}")
+        return JSONResponse(status_code=500, content={"deleted": False, "reason": str(e)})
 
 
 # ===== DOCS MANAGEMENT =====
@@ -368,9 +364,53 @@ def edit_doc_endpoint(payload: EditPayload):
 
 
 @app.delete("/docs/delete")
-def delete_doc_endpoint(payload: TextPayload):
+def delete_doc_endpoint(payload: DeleteDocPayload):
     try:
-        result = delete_document(payload.text)
+        result = delete_document_by_filename(payload.filename)
         return {"ok": True, "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete doc: {e}")
+
+
+@app.post("/docs/upload")
+async def upload_docs(file: UploadFile = File(...)):
+    """Upload one or more files, extract text, and index them into FAISS."""
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    results = []
+
+    file_path = os.path.join(UPLOADS_DIR, file.filename)
+    try:
+        # Save raw file
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # Extract text
+        text = extract_text_from_file(file_path)
+        if not text.strip():
+            results.append({"file": file.filename, "ok": False, "reason": "No text extracted"})
+
+        # Add to FAISS
+        add_result = add_document(text, base_name=os.path.splitext(file.filename)[0])
+
+        results.append({
+            "file": file.filename,
+            "ok": True,
+            "chunks_added": add_result["added"],
+            "total_chunks": add_result["chunks"],
+        })
+
+    except Exception as e:
+        results.append({"file": file.filename, "ok": False, "error": str(e)})
+
+    return {"results": results}
+
+
+@app.post("/docs/reindex")
+async def rebuild_docs_index():
+    result = reindex_docs()
+    return result
+
+@app.post("/memories/reindex")
+async def rebuild_memories_index():
+    result = reindex_memories()
+    return result

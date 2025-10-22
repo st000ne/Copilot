@@ -5,12 +5,22 @@ import {
   editMemory,
   deleteMemory,
   listDocs,
-  addDoc,
-  editDoc,
   deleteDoc,
+  uploadDoc,
 } from "./api";
 
-function SimpleEditor({ value, onSave, onCancel }) {
+/** --- Helper: safely turn any value into printable string --- */
+function safeText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function SimpleEditor({ value, onSave, onCancel, disabled }) {
   const [v, setV] = useState(value || "");
   return (
     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -18,20 +28,49 @@ function SimpleEditor({ value, onSave, onCancel }) {
         value={v}
         onChange={(e) => setV(e.target.value)}
         style={{ flex: 1, padding: 6 }}
+        disabled={disabled}
       />
-      <button onClick={() => onSave(v)}>Save</button>
-      <button onClick={onCancel}>Cancel</button>
+      <button onClick={() => onSave(v)} disabled={disabled}>
+        Save
+      </button>
+      <button onClick={onCancel} disabled={disabled}>
+        Cancel
+      </button>
+    </div>
+  );
+}
+
+function Collapsible({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div
+        style={{
+          cursor: "pointer",
+          fontWeight: "bold",
+          display: "flex",
+          justifyContent: "space-between",
+        }}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span>{safeText(title)}</span>
+        <span>{open ? "▼" : "▶"}</span>
+      </div>
+      {open && <div style={{ paddingLeft: 12, marginTop: 4 }}>{children}</div>}
     </div>
   );
 }
 
 export default function MemoryPanel() {
+  const [open, setOpen] = useState(false);
   const [tab, setTab] = useState("memories");
   const [loading, setLoading] = useState(false);
   const [memories, setMemories] = useState([]);
-  const [docs, setDocs] = useState([]);
+  const [docs, setDocs] = useState({});
   const [adding, setAdding] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
   useEffect(() => {
     refreshAll();
@@ -41,7 +80,10 @@ export default function MemoryPanel() {
     setLoading(true);
     try {
       const mems = await listMemories();
-      setMemories(Array.isArray(mems?.facts) ? mems.facts : []);
+      const facts = (Array.isArray(mems?.facts) ? mems.facts : []).map(
+        (doc) => doc.page_content || doc.content || JSON.stringify(doc)
+      );
+      setMemories(facts);
     } catch (e) {
       console.warn("listMemories failed", e);
       setMemories([]);
@@ -49,227 +91,272 @@ export default function MemoryPanel() {
 
     try {
       const d = await listDocs();
-      // ✅ FIX: Extract docs array properly
-      setDocs(Array.isArray(d?.docs) ? d.docs : []);
+      const docsArray = Array.isArray(d?.docs) ? d.docs : [];
+      const grouped = {};
+      docsArray.forEach((chunk) => {
+        const fileName =
+          chunk.filename || chunk.metadata?.filename || chunk.metadata?.source || "Unknown";
+        const content = safeText(chunk.content || chunk.page_content || chunk.text || chunk);
+        if (!grouped[fileName]) grouped[fileName] = [];
+        grouped[fileName].push({ content, fileName });
+      });
+      setDocs(grouped);
     } catch (e) {
       console.warn("listDocs failed", e);
-      setDocs([]);
+      setDocs({});
     }
-
     setLoading(false);
   }
 
   async function handleAddMemory(text) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
-      await addMemory(text);
+      const res = await addMemory(text);
+      if (res.added === 0) {
+        alert("Failed to add memory: " + (res.reason || "Unknown"));
+        return;
+      }
       setAdding(false);
       await refreshAll();
     } catch (e) {
       alert("Failed to add memory: " + e.message);
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function handleEditMemory(old_text, new_text) {
+    if (submitting) return;
+    setSubmitting(true);
     try {
-      await editMemory(old_text, new_text);
+      const res = await editMemory(old_text, new_text);
+      if (!res.edited) {
+        alert("Failed to edit memory: " + (res.reason || "Unknown"));
+        return;
+      }
       setEditingItem(null);
       await refreshAll();
     } catch (e) {
       alert("Failed to edit memory: " + e.message);
+    } finally {
+      setSubmitting(false);
     }
   }
 
   async function handleDeleteMemory(text) {
     if (!confirm("Delete this memory?")) return;
     try {
-      await deleteMemory(text);
+      const res = await deleteMemory(text);
+      if (!res.deleted) {
+        alert("Memory deletion failed: " + (res.reason || "Unknown"));
+        return;
+      }
       await refreshAll();
     } catch (e) {
       alert("Failed to delete memory: " + e.message);
     }
   }
 
-  async function handleAddDoc(text) {
+  async function handleDeleteDoc(fileName) {
+    if (!confirm(`Delete entire document "${fileName}"?`)) return;
     try {
-      await addDoc(text);
-      setAdding(false);
+      const res = await deleteDoc(fileName);
+      if (!res.ok && !res.result?.deleted) {
+        alert("Document deletion failed");
+        return;
+      }
       await refreshAll();
     } catch (e) {
-      alert("Failed to add doc: " + e.message);
+      alert("Failed to delete document: " + e.message);
     }
   }
 
-  async function handleEditDoc(old_text, new_text) {
-    try {
-      await editDoc(old_text, new_text);
-      setEditingItem(null);
-      await refreshAll();
-    } catch (e) {
-      alert("Failed to edit doc: " + e.message);
-    }
-  }
 
-  async function handleDeleteDoc(text) {
-    if (!confirm("Delete this doc chunk?")) return;
+  async function handleUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setUploading(true);
     try {
-      await deleteDoc(text);
+      const form = new FormData();
+      form.append("file", file); // matches backend parameter
+      await uploadDoc(form);
       await refreshAll();
-    } catch (e) {
-      alert("Failed to delete doc: " + e.message);
+      alert(`File "${file.name}" uploaded successfully!`);
+    } catch (err) {
+      alert("Upload failed: " + err.message);
+    } finally {
+      setUploading(false);
+      e.target.value = "";
     }
-  }
-
-  function getDisplayText(item) {
-    if (typeof item === "string") return item;
-    if (item?.content) return item.content;
-    if (item?.text) return item.text;
-    return JSON.stringify(item);
   }
 
   return (
-    <div
-      style={{
-        width: 360,
-        borderLeft: "1px solid #ddd",
-        padding: 12,
-        overflowY: "auto",
-        background: "#fff",
-      }}
-    >
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button
-          onClick={() => setTab("memories")}
-          style={{ fontWeight: tab === "memories" ? "bold" : "normal" }}
-        >
-          Memories
-        </button>
-        <button
-          onClick={() => setTab("docs")}
-          style={{ fontWeight: tab === "docs" ? "bold" : "normal" }}
-        >
-          Docs
-        </button>
-        <button onClick={refreshAll} style={{ marginLeft: "auto" }}>
-          Refresh
-        </button>
-      </div>
+    <>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          position: "fixed",
+          top: 20,
+          right: open ? 370 : 20,
+          zIndex: 1000,
+          padding: "6px 12px",
+          borderRadius: 4,
+          background: "#333",
+          color: "#fff",
+          border: "none",
+          cursor: "pointer",
+        }}
+      >
+        {open ? "Close Knowledge" : "Open Knowledge"}
+      </button>
 
-      {adding ? (
-        <div style={{ marginBottom: 12 }}>
-          {tab === "memories" && (
-            <>
-              <h4>Add memory</h4>
-              <SimpleEditor
-                value=""
-                onSave={(v) => handleAddMemory(v)}
-                onCancel={() => setAdding(false)}
-              />
-            </>
-          )}
-          {tab === "docs" && (
-            <>
-              <h4>Add doc text</h4>
-              <SimpleEditor
-                value=""
-                onSave={(v) => handleAddDoc(v)}
-                onCancel={() => setAdding(false)}
-              />
-              <p style={{ fontSize: 12, color: "#666" }}>
-                Long text will be split into chunks and indexed.
-              </p>
-            </>
-          )}
-        </div>
-      ) : (
+      <div
+        style={{
+          position: "fixed",
+          top: 0,
+          right: 0,
+          width: 360,
+          height: "100%",
+          background: "#fff",
+          borderLeft: "1px solid #ddd",
+          padding: 12,
+          overflowY: "auto",
+          transform: `translateX(${open ? "0" : "100%"})`,
+          transition: "transform 0.3s ease",
+          zIndex: 999,
+        }}
+      >
         <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          <button onClick={() => setAdding(true)}>+ Add</button>
-          <button onClick={refreshAll}>Refresh</button>
+          <button
+            onClick={() => setTab("memories")}
+            style={{ fontWeight: tab === "memories" ? "bold" : "normal" }}
+          >
+            Memories
+          </button>
+          <button
+            onClick={() => setTab("docs")}
+            style={{ fontWeight: tab === "docs" ? "bold" : "normal" }}
+          >
+            Docs
+          </button>
+          <button onClick={refreshAll} style={{ marginLeft: "auto" }}>
+            Refresh
+          </button>
         </div>
-      )}
 
-      {editingItem && (
-        <div style={{ marginBottom: 12 }}>
-          <h4>Edit</h4>
-          <SimpleEditor
-            value={getDisplayText(editingItem.old)}
-            onSave={(v) => {
-              if (editingItem.type === "memory")
-                handleEditMemory(editingItem.old, v);
-              else if (editingItem.type === "doc")
-                handleEditDoc(editingItem.old, v);
-            }}
-            onCancel={() => setEditingItem(null)}
-          />
-        </div>
-      )}
+        {loading && <p>Loading...</p>}
 
-      {loading && <p>Loading...</p>}
+        {tab === "memories" && (
+          <>
+            {adding && (
+              <div style={{ marginBottom: 12 }}>
+                <h4>Add memory</h4>
+                <SimpleEditor
+                  value=""
+                  onSave={(v) => handleAddMemory(v)}
+                  onCancel={() => setAdding(false)}
+                  disabled={submitting}
+                />
+              </div>
+            )}
 
-      {tab === "memories" && (
-        <>
-          {Array.isArray(memories) && memories.length > 0 ? (
-            memories.map((m, i) => {
-              const text = typeof m === "string" ? m : m.content || "";
-              return (
-                <div key={i} style={{ marginBottom: 6 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ flex: 1 }}>{text}</div>
-                    <div>
-                      <button
-                        onClick={() =>
-                          setEditingItem({ type: "memory", old: text })
-                        }
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handleDeleteMemory(text)}
-                        style={{ marginLeft: 6 }}
-                      >
-                        Delete
-                      </button>
-                    </div>
+            {editingItem && (
+              <div style={{ marginBottom: 12 }}>
+                <h4>Edit</h4>
+                <SimpleEditor
+                  value={editingItem.value}
+                  onSave={(v) => handleEditMemory(editingItem.value, v)}
+                  onCancel={() => setEditingItem(null)}
+                  disabled={submitting}
+                />
+              </div>
+            )}
+
+            {memories?.length > 0 ? (
+              memories.map((m, i) => (
+                <div
+                  key={i}
+                  style={{
+                    marginBottom: 6,
+                    display: "flex",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <span>{safeText(m)}</span>
+                  <div>
+                    <button
+                      onClick={() =>
+                        setEditingItem({ type: "memory", value: m })
+                      }
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => handleDeleteMemory(m)}
+                      style={{ marginLeft: 6 }}
+                    >
+                      Delete
+                    </button>
                   </div>
                 </div>
-              );
-            })
-          ) : (
-            <p style={{ color: "#666" }}>No memories yet.</p>
-          )}
-        </>
-      )}
+              ))
+            ) : (
+              <p style={{ color: "#666" }}>No memories yet.</p>
+            )}
 
-      {tab === "docs" && (
-        <>
-          {Array.isArray(docs) && docs.length > 0 ? (
-            docs.map((d, i) => {
-              const text = getDisplayText(d);
-              return (
-                <div key={i} style={{ marginBottom: 6 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ flex: 1 }}>{text}</div>
-                    <div>
-                      <button
-                        onClick={() => setEditingItem({ type: "doc", old: d })}
+            {!adding && !editingItem && (
+              <div style={{ marginTop: 12 }}>
+                <button onClick={() => setAdding(true)}>+ Add</button>
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "docs" && (
+          <>
+            <div style={{ marginBottom: 12 }}>
+              <h4>Upload document</h4>
+              <input
+                type="file"
+                accept=".txt,.pdf,.docx"
+                onChange={handleUpload}
+                disabled={uploading}
+              />
+            </div>
+
+            {docs && Object.keys(docs).length > 0 ? (
+              Object.keys(docs).map((file) => (
+                <Collapsible
+                  key={file}
+                  title={file === "Unknown" ? "Unnamed Document" : file}
+                >
+                  <button
+                    onClick={() => handleDeleteDoc(file)}
+                    style={{ marginBottom: 8 }}
+                  >
+                    Delete entire document
+                  </button>
+                  {docs[file].map((chunk, idx) => (
+                    <Collapsible key={idx} title={`Chunk ${idx + 1}`}>
+                      <pre
+                        style={{
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                        }}
                       >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handleDeleteDoc(d)}
-                        style={{ marginLeft: 6 }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          ) : (
-            <p style={{ color: "#666" }}>No docs indexed.</p>
-          )}
-        </>
-      )}
-    </div>
+                        {safeText(chunk.content)}
+                      </pre>
+                    </Collapsible>
+                  ))}
+                </Collapsible>
+              ))
+            ) : (
+              <p style={{ color: "#666" }}>No docs indexed.</p>
+            )}
+          </>
+        )}
+      </div>
+    </>
   );
 }

@@ -124,12 +124,21 @@ export async function editDoc(old_text, new_text) {
   return res.json();
 }
 
-export async function deleteDoc(text) {
+export async function deleteDoc(filename) {
   const res = await fetch(`${API_URL}/docs/delete`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ filename }),
   });
   if (!res.ok) throw new Error("Failed to delete doc");
+  return res.json();
+}
+
+export async function uploadDoc(formData) {
+  const res = await fetch(`${API_URL}/docs/upload`, {
+    method: "POST",
+    body: formData, // don't set Content-Type manually — the browser will set the multipart boundary
+  });
+  if (!res.ok) throw new Error("Failed to upload document");
   return res.json();
 }

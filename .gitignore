@@ -3,3 +3,8 @@
 .env
 node_modules
 copilot.db
+memories.json
+data
+index.faiss
+index.pkl
+test.py
