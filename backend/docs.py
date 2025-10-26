@@ -1,12 +1,13 @@
+import json
 import os
+import re
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
-from pydantic import SecretStr
 from pathlib import Path
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain.schema import Document
+from backend.llm_client import llm, embeddings
+from langchain.schema import Document, HumanMessage
 from backend.file_utils import extract_text_from_file
 
 # -------------------------------------------------
@@ -21,11 +22,6 @@ if not OPENAI_API_KEY:
 
 DOCS_INDEX_PATH = "backend/memory/faiss_docs_index"
 DOCS_DIR = "backend/data/docs"
-
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    openai_api_key=SecretStr(OPENAI_API_KEY)
-)
 
 # -------------------------------------------------
 # Index Utilities
@@ -106,51 +102,90 @@ def add_document(
     chunk_overlap: int = 100,
     duplicate_threshold: float = 0.9,
     base_name: Optional[str] = None,
+    use_outline: bool = True,
 ):
     """
     Add a long document text to the FAISS docs index.
-    Text will be split into chunks and stored as Documents.
-    Optionally attaches a base_name for source identification.
+    Optionally uses an LLM to segment the text into coherent sections before chunking.
     """
+
     text = text.strip()
     if not text:
         return {"added": 0, "reason": "Empty text"}
 
     index = get_or_create_docs_index()
+    sections = [{"title": "Full Document", "text": text}]
 
-    # Split into chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " ", ""],
-    )
-    chunks = splitter.split_text(text)
+    if use_outline and len(text) > 5000:
+        try:
+            prompt = (
+                "You are an expert document parser. Split the following text into meaningful, coherent sections. "
+                "Each section should represent a logical unit of the document (e.g., a heading, topic, or paragraph group). "
+                "Return a valid JSON list of objects, each with 'title' and 'text' keys.\n\n"
+                "If the document has natural headings or numbered sections, use those titles.\n\n"
+                "Don't summarize. Keep original text as much as possible.\n\n"
+                f"Document:\n{text[:15000]}\n\n"  # cut off to avoid overloading the prompt
+                "Return only valid JSON. Example output:\n"
+                "[{\"title\": \"Introduction\", \"text\": \"...\"}, {\"title\": \"Method\", \"text\": \"...\"}]"
+            )
+            response = llm.invoke([HumanMessage(content=prompt)])
+            raw = response.content.strip()
+            start, end = raw.find("["), raw.rfind("]") + 1
+            if start != -1 and end != -1:
+                raw = raw[start:end]
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and all(isinstance(s, dict) for s in parsed):
+                sections = parsed
+        except Exception as e:
+            print(f"[Outline Warning] Failed to generate sections: {e}")
+            paragraphs = re.split(r"\n{2,}", text)
+            sections = [
+                {"title": f"Section {i+1}", "text": p.strip()}
+                for i, p in enumerate(paragraphs) if p.strip()
+            ]
 
     added = 0
+    total_chunks = 0
     new_docs = []
 
-    for i, chunk in enumerate(chunks):
-        # Check for near-duplicates
-        existing = index.similarity_search_with_score(chunk, k=1)
-        if existing:
-            _, score = existing[0]
-            similarity = 1 - score / 2  # normalize to 0–1
-            if similarity >= duplicate_threshold:
-                continue
+    for section in sections:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", ".", " ", ""],
+        )
+        chunks = splitter.split_text(section["text"])
+        total_chunks += len(chunks)
 
-        metadata = {}
-        if base_name:
-            metadata["filename"] = base_name
-            metadata["source"] = f"{base_name}_chunk{i+1}"
+        for i, chunk in enumerate(chunks):
+            existing = index.similarity_search_with_score(chunk, k=1)
+            if existing:
+                _, score = existing[0]
+                similarity = 1 - score / 2
+                if similarity >= duplicate_threshold:
+                    continue
 
-        new_docs.append(Document(page_content=chunk, metadata=metadata))
-        added += 1
+            metadata = {
+                "section_title": section["title"],
+                "chunk_index": i + 1,
+            }
+            if base_name:
+                metadata["filename"] = base_name
+                metadata["source"] = f"{base_name}_{section['title']}_chunk{i+1}"
+
+            new_docs.append(Document(page_content=chunk, metadata=metadata))
+            added += 1
 
     if new_docs:
         index.add_documents(new_docs)
         save_docs_index(index)
 
-    return {"added": added, "chunks": len(chunks)}
+    return {
+        "added": added,
+        "chunks": total_chunks,
+        "sections": len(sections),
+    }
+
 
 
 def query_docs(query: str, threshold: float = 0.75, k: int = 5) -> List[Dict]:
@@ -301,3 +336,54 @@ def reindex_docs():
         "files_indexed": len(all_texts),
         "chunks": len(all_docs),
     }
+
+
+def generate_outline_sections(text: str, max_section_len: int = 5000) -> list[dict]:
+    """
+    Use the LLM to create a structured outline of the document.
+    Returns a list of {title, text} objects representing logical sections.
+    If the LLM fails or text is too small, returns a single section with the full text.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # Skip LLM outlining if the text is short enough
+    if len(text) <= max_section_len:
+        return [{"title": "Full Document", "text": text}]
+
+    prompt = (
+        "You are an expert document parser. Split the following text into meaningful, coherent sections. "
+        "Each section should represent a logical unit of the document (e.g., a heading, topic, or paragraph group). "
+        "Return a valid JSON list of objects, each with 'title' and 'text' keys.\n\n"
+        "If the document has natural headings or numbered sections, use those titles.\n\n"
+        f"Document:\n{text[:15000]}\n\n"  # cut off to avoid overloading the prompt
+        "Return only valid JSON. Example output:\n"
+        "[{\"title\": \"Introduction\", \"text\": \"...\"}, {\"title\": \"Method\", \"text\": \"...\"}]"
+    )
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+
+        # Try to find JSON in case model adds text before/after
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start != -1 and end != -1:
+            raw = raw[start:end]
+
+        sections = json.loads(raw)
+        # Basic sanity check
+        if not isinstance(sections, list) or not all(isinstance(s, dict) for s in sections):
+            raise ValueError("Invalid JSON structure from LLM")
+        return sections
+
+    except Exception as e:
+        print(f"[Outline Warning] Failed to generate structured outline: {e}")
+        # Fallback: rough chunking if LLM fails
+        import re
+        paragraphs = re.split(r"\n{2,}", text)
+        return [
+            {"title": f"Section {i+1}", "text": p.strip()}
+            for i, p in enumerate(paragraphs) if p.strip()
+        ]

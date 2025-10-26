@@ -266,9 +266,7 @@ async def chat(req: ChatRequest):
         try:
             # 🔹 Run synchronous pipeline safely in background thread
             loop = asyncio.get_running_loop()
-            reply = await loop.run_in_executor(
-                None, lambda: run_chat([m.model_dump() for m in req.messages])
-            )
+            reply = await run_chat([m.model_dump() for m in req.messages])
 
             # 🔹 Save assistant reply
             assistant_msg = ChatMessage(

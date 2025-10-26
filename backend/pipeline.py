@@ -3,19 +3,22 @@ import os
 import re
 import numpy as np
 import tiktoken
+import asyncio
 from dotenv import load_dotenv
 from pathlib import Path
 from pydantic import SecretStr
 from difflib import SequenceMatcher
 
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 # Direct access helpers for FAISS-based storage
 from backend.memory import query_memory, get_or_create_faiss_index
 from backend.docs import query_docs, get_or_create_docs_index
 from backend.embeddings_cache import get_or_create_embedding
 from backend.helper import _extract_texts_from_faiss_index
+from backend.llm_client import llm, summarizer, embeddings
+from backend.tools import list_tools, get_tool
+import json
 
 # --- Load environment ---
 dotenv_path = Path(__file__).parent / ".env"
@@ -33,11 +36,6 @@ SYSTEM_PROMPT = (
     "You are a helpful, intelligent assistant that remembers context "
     "and answers clearly, concisely, and helpfully."
 )
-
-# --- Initialize models ---
-llm = ChatOpenAI(model_name=MODEL_NAME, temperature=0.7, openai_api_key=SecretStr(OPENAI_API_KEY))
-summarizer = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3, openai_api_key=SecretStr(OPENAI_API_KEY))
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=SecretStr(OPENAI_API_KEY))
 
 # --- Helpers ---
 def num_tokens_from_messages(messages, model_name=MODEL_NAME):
@@ -174,12 +172,12 @@ def retrieve_context(user_input: str, mem_threshold: float = 0.7, doc_threshold:
 
 
 # --- Chat orchestration ---
-def run_chat(messages: list[dict]):
-    """Run chat with hybrid context injection and summarization."""
+async def run_chat(messages: list[dict]):
+    """Run chat with context retrieval, summarization, and tool calling."""
     if not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-    # Summarize old conversation
+    # --- Summarize old conversation
     if len(messages) > SUMMARIZE_AFTER_MESSAGES:
         summary_text = summarize_messages(messages[:-10])
         messages = (
@@ -187,22 +185,18 @@ def run_chat(messages: list[dict]):
             + messages[-10:]
         )
 
-    # Trim token overflow
+    # --- Trim context overflow
     while num_tokens_from_messages(messages) > MAX_CONTEXT_TOKENS and len(messages) > 5:
         messages.pop(1)
 
-    # Retrieve hybrid context
+    # --- Retrieve hybrid context
     user_last = next((m for m in reversed(messages) if m["role"] == "user"), None)
     context_snippets = retrieve_context(user_last["content"]) if user_last else []
 
     if context_snippets:
+        injected = "You have access to the following relevant context..."
         mem_texts = [c for c in context_snippets if c["type"] == "memory"]
         doc_texts = [c for c in context_snippets if c["type"] == "doc"]
-
-        injected = (
-            "You have access to the following relevant context from user memory and reference documents. "
-            "Use these facts and snippets to inform your reply (treat facts as reliable when applicable):\n"
-        )
 
         if mem_texts:
             injected += "\n---\nMemories:\n" + "\n".join(
@@ -215,7 +209,7 @@ def run_chat(messages: list[dict]):
 
         messages.insert(1, {"role": "system", "content": injected})
 
-    # Convert to LangChain message objects
+    # --- Convert to LangChain messages
     lc_messages = [
         HumanMessage(content=m["content"]) if m["role"] == "user" else
         AIMessage(content=m["content"]) if m["role"] == "assistant" else
@@ -223,5 +217,41 @@ def run_chat(messages: list[dict]):
         for m in messages
     ]
 
-    response = llm.invoke(lc_messages)
+    # --- Tool definitions
+    tool_schemas = [t.to_schema() for t in list_tools()]
+
+    # --- Step 1: Ask model if a tool is needed
+    response = await llm.ainvoke(lc_messages, tools=tool_schemas)
+
+    # --- Step 2: If tool is called
+    tool_outputs = []
+    if hasattr(response, "additional_kwargs") and "tool_calls" in response.additional_kwargs:
+        for call in response.additional_kwargs["tool_calls"]:
+            tool_name = call["function"]["name"]
+            tool_args = json.loads(call["function"]["arguments"])
+            tool = get_tool(tool_name)
+            if not tool:
+                result = f"Tool '{tool_name}' not found."
+            else:
+                try:
+                    # Run async if available
+                    if hasattr(tool, "arun"):
+                        result = await tool.arun(**tool_args)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        result = await loop.run_in_executor(None, lambda: tool.run(**tool_args))
+                except Exception as e:
+                    result = f"Error executing {tool_name}: {e}"
+
+            tool_outputs.append(
+                {"role": "tool", "content": result, "name": tool_name}
+            )
+
+        # --- Step 3: Feed tool outputs back in
+        lc_messages.extend([AIMessage(content=response.content)] + [
+            AIMessage(content=f"Tool {t['name']} output:\n{t['content']}") for t in tool_outputs
+        ])
+        response = await llm.ainvoke(lc_messages)
+
     return {"role": "assistant", "content": response.content}
+

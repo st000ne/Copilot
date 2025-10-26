@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from pydantic import SecretStr
 from pathlib import Path
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
+from backend.llm_client import embeddings
 from langchain.schema import Document
 from backend.helper import _extract_texts_from_faiss_index
 
@@ -23,10 +23,6 @@ MEMORIES_PATH = "backend/data/memories.json"
 FAISS_PATH = "backend/memory/faiss_index"
 os.makedirs("backend/memory", exist_ok=True)
 os.makedirs("backend/data", exist_ok=True)
-
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small", openai_api_key=SecretStr(OPENAI_API_KEY)
-)
 
 # -------------------------------------------------
 # JSON Utilities
