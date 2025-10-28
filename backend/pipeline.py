@@ -172,8 +172,26 @@ def retrieve_context(user_input: str, mem_threshold: float = 0.7, doc_threshold:
 
 
 # --- Chat orchestration ---
-async def run_chat(messages: list[dict]):
-    """Run chat with context retrieval, summarization, and tool calling."""
+async def run_chat(messages: list[dict], agent_mode: bool = False):
+    """Run chat with context retrieval, summarization, and tool calling (or agent mode)."""
+    from backend.agents.integration import run_agent_chat  # lazy import to avoid cycles
+
+    if agent_mode:
+        # --- Extract user message & history
+        user_message = messages[-1]["content"] if messages else ""
+        history = messages[:-1]
+        result = await run_agent_chat(user_message, history)
+
+        return {
+            "role": "assistant",
+            "content": result.final_text,
+            "metadata": {
+                "thoughts": result.thoughts,
+                "trace": [t.dict() for t in result.trace],
+            },
+        }
+
+    # -------- Normal (non-agent) pipeline below --------
     if not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
@@ -254,4 +272,5 @@ async def run_chat(messages: list[dict]):
         response = await llm.ainvoke(lc_messages)
 
     return {"role": "assistant", "content": response.content}
+
 

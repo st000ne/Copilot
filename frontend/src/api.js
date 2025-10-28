@@ -7,11 +7,15 @@ export async function createSession() {
   return res.json();
 }
 
-export async function sendChat(sessionId, messages) {
+export async function sendChat(sessionId, messages, agentMode = false) {
   const res = await fetch(`${API_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, messages }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      messages,
+      agent_mode: agentMode,
+    }),
   });
   if (!res.ok) throw new Error("Failed to send chat");
   return res.json();

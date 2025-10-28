@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Body, UploadFile, File
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import func
@@ -224,7 +224,7 @@ async def continue_chat(session_id: int):
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, agent_mode: bool = Query(False)):
     if not req.session_id:
         raise HTTPException(status_code=400, detail="Missing session_id")
 
@@ -233,7 +233,7 @@ async def chat(req: ChatRequest):
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # 🔹 Rate limiting
+        # --- Rate limiting
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)
         recent_msgs = (
             db.query(ChatMessage)
@@ -244,31 +244,29 @@ async def chat(req: ChatRequest):
         if recent_msgs >= RATE_LIMIT:
             raise HTTPException(status_code=429, detail="Rate limit exceeded (20 requests/minute).")
 
-        # 🔹 Validate input length
+        # --- Validate input length
         total_chars = sum(len(m.content) for m in req.messages)
         if total_chars > 20000:
             raise HTTPException(status_code=400, detail="Input too long (20k char limit).")
 
-        # 🔹 Save user messages and collect them for response
+        # --- Save user messages
         user_messages = []
         for m in req.messages:
             msg = ChatMessage(session_id=req.session_id, role=m.role, content=m.content)
             db.add(msg)
-            db.flush()  # ensures ID is generated before commit
+            db.flush()
             user_messages.append(msg)
         db.commit()
 
-        # 🔹 Update session activity timestamp
+        # --- Update session
         session.updated_at = datetime.now(timezone.utc)
         db.add(session)
         db.commit()
 
         try:
-            # 🔹 Run synchronous pipeline safely in background thread
-            loop = asyncio.get_running_loop()
-            reply = await run_chat([m.model_dump() for m in req.messages])
+            reply = await run_chat([m.model_dump() for m in req.messages], agent_mode=agent_mode)
 
-            # 🔹 Save assistant reply
+            # --- Save assistant reply
             assistant_msg = ChatMessage(
                 session_id=req.session_id, role=reply["role"], content=reply["content"]
             )
@@ -277,7 +275,6 @@ async def chat(req: ChatRequest):
             session.request_count += 1
             db.commit()
 
-            # 🔹 Return all messages (user + assistant) with IDs
             return {
                 "session_id": req.session_id,
                 "messages": [
@@ -289,10 +286,12 @@ async def chat(req: ChatRequest):
                     }
                     for m in user_messages + [assistant_msg]
                 ],
+                "metadata": reply.get("metadata"),
             }
 
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Pipeline error: {str(e)}")
+
 
 
 # ===== MEMORY MANAGEMENT =====

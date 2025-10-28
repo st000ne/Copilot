@@ -10,8 +10,6 @@ import {
   continueChat,
 } from "./api";
 
-// ... keep Message component unchanged (copy from your original) ...
-
 function Message({ msg, onEdit, onContinue }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(msg.text);
@@ -87,6 +85,14 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [agentMode, setAgentMode] = useState(
+    () => localStorage.getItem("agent_mode") === "true"
+  );
+
+  // Save toggle state to localStorage
+  useEffect(() => {
+    localStorage.setItem("agent_mode", agentMode);
+  }, [agentMode]);
 
   // Load or create session
   useEffect(() => {
@@ -151,22 +157,19 @@ export default function App() {
     if (!input.trim() || !sessionId) return;
     const userMsg = { role: "user", content: input };
 
-    // Add user message immediately
     setMessages((m) => [...m, { from: "user", text: input }]);
     setInput("");
     setLoading(true);
 
     try {
-      const res = await sendChat(sessionId, [userMsg]);
+      const res = await sendChat(sessionId, [userMsg], agentMode);
 
       if (res.reply) {
-        // Simple backend format
         setMessages((m) => [
           ...m,
           { id: res.reply.id, from: "assistant", text: res.reply.content },
         ]);
       } else if (res.messages) {
-        // Full conversation response
         const newMsgs = res.messages
           .filter((msg) => msg.role !== "user")
           .map((msg) => ({
@@ -190,19 +193,13 @@ export default function App() {
   async function handleEditMessage(id, newText) {
     try {
       const res = await editAndRegenerateMessage(id, newText);
-      // Update edited message text
       setMessages((msgs) =>
         msgs.map((m) => (m.id === id ? { ...m, text: newText } : m))
       );
-      // Append new regenerated assistant reply
       if (res.reply) {
         setMessages((msgs) => [
           ...msgs,
-          {
-            id: res.reply.id,
-            from: "assistant",
-            text: res.reply.content,
-          },
+          { id: res.reply.id, from: "assistant", text: res.reply.content },
         ]);
       }
     } catch (err) {
@@ -224,7 +221,10 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "sans-serif" }}>
-      <Sidebar currentSessionId={sessionId} onSelectSession={(id) => setSessionId(id)} />
+      <Sidebar
+        currentSessionId={sessionId}
+        onSelectSession={(id) => setSessionId(id)}
+      />
 
       {/* Chat Area */}
       <div
@@ -236,10 +236,42 @@ export default function App() {
           backgroundColor: "gray",
         }}
       >
-        <h1 style={{ marginBottom: 10 }}>AI Copilot</h1>
-        <p style={{ fontSize: "0.9em", color: "black" }}>
-          Session ID: {sessionId || "(loading...)"}
-        </p>
+        {/* Header + Agent Toggle */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: 10,
+          }}
+        >
+          <div>
+            <h1 style={{ margin: 0 }}>AI Copilot</h1>
+            <p style={{ fontSize: "0.9em", color: "black" }}>
+              Session ID: {sessionId || "(loading...)"}
+            </p>
+          </div>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              cursor: "pointer",
+              background: "#eee",
+              padding: "6px 10px",
+              borderRadius: 8,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={agentMode}
+              onChange={(e) => setAgentMode(e.target.checked)}
+            />
+            <span style={{ color: agentMode ? "green" : "black" }}>
+              Agent Mode {agentMode ? "🧠" : ""}
+            </span>
+          </label>
+        </div>
 
         {/* Messages */}
         <div
@@ -257,7 +289,12 @@ export default function App() {
             <p style={{ color: "#999" }}>No messages yet.</p>
           ) : (
             messages.map((m, i) => (
-              <Message key={i} msg={m} onEdit={handleEditMessage} onContinue={handleContinue} />
+              <Message
+                key={i}
+                msg={m}
+                onEdit={handleEditMessage}
+                onContinue={handleContinue}
+              />
             ))
           )}
         </div>

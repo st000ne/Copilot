@@ -14,5 +14,4 @@ PyPDF2
 python-docx
 python-multipart
 deepl
-googletrans==4.0.0-rc1
 spacy
